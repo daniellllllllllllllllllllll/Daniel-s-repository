@@ -1,0 +1,56 @@
+# 虚拟环境（迁移打包必须删除）
+venv/
+venv_clean/
+.venv/
+env/
+ENV/
+
+# Python 构建与测试缓存
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 日志与本地运行记录
+*.log
+*.out
+*.pid
+
+# 敏感配置与密钥 —— 绝不入库
+.env
+.env.*
+!.env.example
+crypto/*.key
+crypto/*.pem
+*.keystore
+*.secret
+*.secrets
+*.pem
+*.p12
+*.pfx
+
+# 实验产物
+results/
+results_*/
+
+# 合约编译与本地链数据
+blockchain/build/
+ganache-data/
+.ganache/
+
+# 编辑器
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db

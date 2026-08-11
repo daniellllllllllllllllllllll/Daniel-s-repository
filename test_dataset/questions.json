@@ -1,0 +1,273 @@
+{
+  "meta": {
+    "name": "BlkMaC 对照实验统一测试题库",
+    "version": "1.0",
+    "description": "三组对照实验（A 单LLM / B 普通多智能体 / C 完整BlkMaC）共用同一套题目。每题标注领域与难度，复合题给出 parts 拆解，用于评估任务拆解与动态分配的效果。",
+    "fields": {
+      "id": "题目编号",
+      "question": "完整题面，对照组A 直接作答",
+      "answer": "整题标准答案；复合题为各部分答案的串联",
+      "domain": "主领域 math/code/logic/knowledge/writing",
+      "difficulty": "难度 1~5",
+      "parts": "子任务拆解。B/C 组按此拆分派发；每个 part 的 answer 是该子任务的标准答案"
+    },
+    "scoring": "正确判定 = 最终答案包含全部 part 的标准答案（单任务题即包含 answer 本身）"
+  },
+  "questions": [
+    {
+      "id": "Q01",
+      "question": "计算 17 乘以 23 等于多少？",
+      "answer": "391",
+      "domain": "math",
+      "difficulty": 2,
+      "parts": [
+        { "description": "计算 17 乘以 23 等于多少？", "answer": "391", "domain": "math", "difficulty": 2 }
+      ]
+    },
+    {
+      "id": "Q02",
+      "question": "计算 144 的平方根等于多少？",
+      "answer": "12",
+      "domain": "math",
+      "difficulty": 1,
+      "parts": [
+        { "description": "计算 144 的平方根等于多少？", "answer": "12", "domain": "math", "difficulty": 1 }
+      ]
+    },
+    {
+      "id": "Q03",
+      "question": "一个等差数列首项为 3、公差为 5，第 10 项是多少？",
+      "answer": "48",
+      "domain": "math",
+      "difficulty": 3,
+      "parts": [
+        { "description": "一个等差数列首项为 3、公差为 5，第 10 项是多少？", "answer": "48", "domain": "math", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q04",
+      "question": "用 Python 写一行代码，把列表 nums 里的偶数筛出来，应该怎么写？",
+      "answer": "[x for x in nums if x % 2 == 0]",
+      "domain": "code",
+      "difficulty": 2,
+      "parts": [
+        { "description": "用 Python 写一行代码，把列表 nums 里的偶数筛出来，应该怎么写？", "answer": "[x for x in nums if x % 2 == 0]", "domain": "code", "difficulty": 2 }
+      ]
+    },
+    {
+      "id": "Q05",
+      "question": "Python 中判断字符串 s 是否为回文，最简洁的写法是什么？",
+      "answer": "s == s[::-1]",
+      "domain": "code",
+      "difficulty": 2,
+      "parts": [
+        { "description": "Python 中判断字符串 s 是否为回文，最简洁的写法是什么？", "answer": "s == s[::-1]", "domain": "code", "difficulty": 2 }
+      ]
+    },
+    {
+      "id": "Q06",
+      "question": "快速排序的平均时间复杂度是多少？",
+      "answer": "O(nlogn)",
+      "domain": "code",
+      "difficulty": 3,
+      "parts": [
+        { "description": "快速排序的平均时间复杂度是多少？", "answer": "O(nlogn)", "domain": "code", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q07",
+      "question": "如果所有的玫瑰都是花，而有些花会凋谢，能否推出「有些玫瑰会凋谢」？",
+      "answer": "不能",
+      "domain": "logic",
+      "difficulty": 4,
+      "parts": [
+        { "description": "如果所有的玫瑰都是花，而有些花会凋谢，能否推出「有些玫瑰会凋谢」？", "answer": "不能", "domain": "logic", "difficulty": 4 }
+      ]
+    },
+    {
+      "id": "Q08",
+      "question": "三个人分别说了一句话，其中只有一个人说真话。甲说乙撒谎，乙说丙撒谎，丙说甲乙都撒谎。请问谁说了真话？",
+      "answer": "乙",
+      "domain": "logic",
+      "difficulty": 5,
+      "parts": [
+        { "description": "三个人分别说了一句话，其中只有一个人说真话。甲说乙撒谎，乙说丙撒谎，丙说甲乙都撒谎。请问谁说了真话？", "answer": "乙", "domain": "logic", "difficulty": 5 }
+      ]
+    },
+    {
+      "id": "Q09",
+      "question": "一列数 2, 6, 12, 20, 30 的下一项是多少？",
+      "answer": "42",
+      "domain": "logic",
+      "difficulty": 3,
+      "parts": [
+        { "description": "一列数 2, 6, 12, 20, 30 的下一项是多少？", "answer": "42", "domain": "logic", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q10",
+      "question": "中华人民共和国的首都是哪座城市？",
+      "answer": "北京",
+      "domain": "knowledge",
+      "difficulty": 1,
+      "parts": [
+        { "description": "中华人民共和国的首都是哪座城市？", "answer": "北京", "domain": "knowledge", "difficulty": 1 }
+      ]
+    },
+    {
+      "id": "Q11",
+      "question": "区块链中用于保证区块之间不可篡改的核心密码学技术是什么？",
+      "answer": "哈希链",
+      "domain": "knowledge",
+      "difficulty": 3,
+      "parts": [
+        { "description": "区块链中用于保证区块之间不可篡改的核心密码学技术是什么？", "answer": "哈希链", "domain": "knowledge", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q12",
+      "question": "RSA 算法的安全性基于哪个数学难题？",
+      "answer": "大整数分解",
+      "domain": "knowledge",
+      "difficulty": 3,
+      "parts": [
+        { "description": "RSA 算法的安全性基于哪个数学难题？", "answer": "大整数分解", "domain": "knowledge", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q13",
+      "question": "请用一个词概括「多个智能体各司其职、协同完成复杂任务」这种模式。",
+      "answer": "多智能体协同",
+      "domain": "writing",
+      "difficulty": 2,
+      "parts": [
+        { "description": "请用一个词概括「多个智能体各司其职、协同完成复杂任务」这种模式。", "answer": "多智能体协同", "domain": "writing", "difficulty": 2 }
+      ]
+    },
+    {
+      "id": "Q14",
+      "question": "给一篇讲述区块链赋能多智能体协同的论文起一个简短标题。",
+      "answer": "区块链赋能的多智能体协同框架",
+      "domain": "writing",
+      "difficulty": 3,
+      "parts": [
+        { "description": "给一篇讲述区块链赋能多智能体协同的论文起一个简短标题。", "answer": "区块链赋能的多智能体协同框架", "domain": "writing", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q15",
+      "question": "先计算 25 乘以 4 等于多少；再说出中华人民共和国的首都是哪座城市",
+      "answer": "100；北京",
+      "domain": "math",
+      "difficulty": 3,
+      "parts": [
+        { "description": "计算 25 乘以 4 等于多少", "answer": "100", "domain": "math", "difficulty": 2 },
+        { "description": "说出中华人民共和国的首都是哪座城市", "answer": "北京", "domain": "knowledge", "difficulty": 1 }
+      ]
+    },
+    {
+      "id": "Q16",
+      "question": "先计算 9 的立方等于多少；再写出 Python 中反转字符串 s 的写法；最后用一个词概括这两步的共同点",
+      "answer": "729；s[::-1]；计算",
+      "domain": "math",
+      "difficulty": 4,
+      "parts": [
+        { "description": "计算 9 的立方等于多少", "answer": "729", "domain": "math", "difficulty": 2 },
+        { "description": "写出 Python 中反转字符串 s 的写法", "answer": "s[::-1]", "domain": "code", "difficulty": 2 },
+        { "description": "用一个词概括数值计算与字符串处理的共同点", "answer": "计算", "domain": "writing", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q17",
+      "question": "先说出 RSA 安全性基于的数学难题；再说出对称加密的代表算法名称；最后判断二者能否混合使用",
+      "answer": "大整数分解；AES；能",
+      "domain": "knowledge",
+      "difficulty": 4,
+      "parts": [
+        { "description": "说出 RSA 安全性基于的数学难题", "answer": "大整数分解", "domain": "knowledge", "difficulty": 3 },
+        { "description": "说出对称加密的代表算法名称", "answer": "AES", "domain": "knowledge", "difficulty": 2 },
+        { "description": "判断非对称加密与对称加密能否混合使用", "answer": "能", "domain": "logic", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q18",
+      "question": "先计算 100 除以 8 的商保留两位小数；再判断结果是否为整数；最后写出 Python 中取整除的运算符",
+      "answer": "12.50；否；//",
+      "domain": "math",
+      "difficulty": 4,
+      "parts": [
+        { "description": "计算 100 除以 8 的商保留两位小数", "answer": "12.50", "domain": "math", "difficulty": 2 },
+        { "description": "判断 100 除以 8 的结果是否为整数", "answer": "否", "domain": "logic", "difficulty": 2 },
+        { "description": "写出 Python 中取整除的运算符", "answer": "//", "domain": "code", "difficulty": 1 }
+      ]
+    },
+    {
+      "id": "Q19",
+      "question": "先说出哈希函数 SHA-256 输出多少位；再说出它输出多少字节；最后判断能否直接作为 Solidity 的 bytes32",
+      "answer": "256；32；能",
+      "domain": "knowledge",
+      "difficulty": 3,
+      "parts": [
+        { "description": "说出哈希函数 SHA-256 输出多少位", "answer": "256", "domain": "knowledge", "difficulty": 2 },
+        { "description": "说出 SHA-256 输出多少字节", "answer": "32", "domain": "math", "difficulty": 1 },
+        { "description": "判断 32 字节能否直接作为 Solidity 的 bytes32", "answer": "能", "domain": "logic", "difficulty": 2 }
+      ]
+    },
+    {
+      "id": "Q20",
+      "question": "先计算 2 的 10 次方；再写出 Python 中求幂的运算符；最后给这个数值起一个常用别称",
+      "answer": "1024；**；1K",
+      "domain": "math",
+      "difficulty": 3,
+      "parts": [
+        { "description": "计算 2 的 10 次方", "answer": "1024", "domain": "math", "difficulty": 2 },
+        { "description": "写出 Python 中求幂的运算符", "answer": "**", "domain": "code", "difficulty": 1 },
+        { "description": "给数值 1024 起一个常用别称", "answer": "1K", "domain": "writing", "difficulty": 2 }
+      ]
+    },
+    {
+      "id": "Q21",
+      "question": "先判断「所有天鹅都是白的」是否为可证伪命题；再说出证伪它需要什么证据",
+      "answer": "是；一只非白天鹅",
+      "domain": "logic",
+      "difficulty": 4,
+      "parts": [
+        { "description": "判断「所有天鹅都是白的」是否为可证伪命题", "answer": "是", "domain": "logic", "difficulty": 3 },
+        { "description": "说出证伪「所有天鹅都是白的」需要什么证据", "answer": "一只非白天鹅", "domain": "knowledge", "difficulty": 3 }
+      ]
+    },
+    {
+      "id": "Q22",
+      "question": "先说出 TCP 协议是面向连接还是无连接；再说出它用什么机制解决消息边界问题",
+      "answer": "面向连接；长度前缀分帧",
+      "domain": "knowledge",
+      "difficulty": 4,
+      "parts": [
+        { "description": "说出 TCP 协议是面向连接还是无连接", "answer": "面向连接", "domain": "knowledge", "difficulty": 2 },
+        { "description": "说出应用层用什么机制解决 TCP 的消息边界问题", "answer": "长度前缀分帧", "domain": "code", "difficulty": 4 }
+      ]
+    },
+    {
+      "id": "Q23",
+      "question": "先计算 7 的阶乘；再判断结果能否被 10 整除",
+      "answer": "5040；能",
+      "domain": "math",
+      "difficulty": 3,
+      "parts": [
+        { "description": "计算 7 的阶乘", "answer": "5040", "domain": "math", "difficulty": 3 },
+        { "description": "判断 5040 能否被 10 整除", "answer": "能", "domain": "logic", "difficulty": 1 }
+      ]
+    },
+    {
+      "id": "Q24",
+      "question": "先写出 Python 中字典按值排序的关键参数名；再说出排序结果的数据类型",
+      "answer": "key；列表",
+      "domain": "code",
+      "difficulty": 3,
+      "parts": [
+        { "description": "写出 Python 中 sorted 按值排序时用到的关键参数名", "answer": "key", "domain": "code", "difficulty": 2 },
+        { "description": "说出 sorted 函数返回结果的数据类型", "answer": "列表", "domain": "knowledge", "difficulty": 1 }
+      ]
+    }
+  ]
+}
