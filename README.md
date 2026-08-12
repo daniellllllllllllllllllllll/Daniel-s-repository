@@ -4,26 +4,25 @@
 Task Agent，Agent 间通过 **RSA 加密的 TCP 链路**通信，每条交互记录计算 **SHA-256 摘要上链存证**，
 最后跑**三组对照实验**比较正确率、幻觉次数、任务量分布与耗时。
 
-> **【待 Ganache 私有链部署启动后，再进行联调、合约部署测试】**
-> 本机未安装 Node.js，Ganache 私链尚未启动。当前 `.env` 中 `CHAIN_ENABLED=false`，
-> 链相关代码已按 web3.py 7.16.0 写完但**未经真机联调**；其余全部模块可正常运行。
+> 链上模式需要先启动 Ganache/anvil 并部署合约；不需要链时使用 `--no-chain`。
+> `.env` 仅用于本机配置，不应提交或复制到公开仓库。
 
 ---
 
 ## 快速开始
 
 ```powershell
-# 1. 安装依赖（6 个包）
-.\venv\Scripts\pip.exe install -r requirements.txt
+# 1. 安装依赖（推荐使用干净虚拟环境）
+.\venv_clean\Scripts\pip.exe install -r requirements.txt
 
 # 2. 准备配置
 Copy-Item .env.example .env      # 已存在则跳过
 
 # 3. 跑全部测试（链上用例自动 skip）
-.\venv\Scripts\python.exe -m unittest discover -s tests -v
+.\venv_clean\Scripts\python.exe -m unittest discover -s tests -v
 
 # 4. 跑三组对照实验，出图
-.\venv\Scripts\python.exe -m controller.main_controller --mode all --no-chain
+.\venv_clean\Scripts\python.exe -m controller.main_controller --mode all --no-chain
 
 # 5. 看产出
 Get-ChildItem results
@@ -71,6 +70,9 @@ BlkMac_Project/
 ├── .env / .env.example         # 配置（.env 已 gitignore）
 └── requirements.txt
 ```
+
+实验输出目录（`results/`、`results_*`）只保存在本机，不属于源码提交内容；
+`.env`、虚拟环境、Python 缓存和本地密钥同样不会进入 Git。
 
 ---
 
@@ -126,6 +128,42 @@ score = w_cap × capability
 分数会写入 `agent_load.csv`，更新明细保存在运行时的 `TaskAgent.trust_history` 中。
 默认 `static` 模式保留原有 C 组行为，便于与自适应模式做消融对比。
 评分分解会写入 `trace.jsonl` 的 `assignments[].score_breakdown`，可用于论文分析。
+
+### 2.1 消融实验
+
+运行完整的消融实验（相同题库、种子和 Agent 数量）：
+
+```powershell
+python -m controller.main_controller --mode c --ablation `
+  --provider mock --model "5.6 Luna High" --agents 4 --seed 20250728 `
+  --no-chain --no-plot --out results_ablation_mock
+```
+
+固定变体包括：完整方法、去 Trust、去 Adaptive Scheduling、去 Blockchain 和去
+Difficulty Matching。比较指标为 Accuracy、Hallucination、Latency 和 Load Variance。
+其中 `no_blockchain` 必须在带链实验中与完整方法比较；无链运行时两者都没有链路，
+不能把它解释为区块链开销对照。
+
+在当前 24 题 MockLLM 控制实验中，完整方法为 95.8% 正确率、2 次幻觉、382.09 ms
+平均耗时和 18.19 负载方差；去 Adaptive Scheduling 与去 Difficulty Matching 均为
+100.0% 正确率、1 次幻觉。该结果只说明当前受控模拟设置下的表现，不能宣称所有模型和
+任务上都必然提升。
+
+### 3.3 Adaptive Trust-aware Scheduling
+
+启用 Trust-aware 机制：
+
+```powershell
+python -m controller.main_controller --mode c --scheduling adaptive --trust-aware `
+  --provider mock --model "5.6 Luna High" --agents 4 --seed 20250728 `
+  --no-chain --no-plot --out results_trust_aware
+```
+
+Trust Score 初始值默认为 `0.5`，成功增加 `0.05`，识别到幻觉扣除 `0.15`，执行失败
+扣除 `0.10`，并限制在 `[0, 1]`。这些参数可通过 `.env` 中的
+`TRUST_INITIAL_SCORE`、`TRUST_SUCCESS_REWARD`、`TRUST_HALLUCINATION_PENALTY` 和
+`TRUST_FAILURE_PENALTY` 调整。Trust Score 通过 `SCORE_W_TRUST` 融入自适应调度，
+更新次数、当前分数和最近事件写入 `agent_load.csv`，评分分解写入 `trace.jsonl`。
 
 **产出**（`results/`）：`metrics.csv`、`per_question.csv`、`agent_load.csv`、`trace.jsonl`，
 以及三张图 `fig_accuracy_hallucination.png`、`fig_agent_load.png`、`fig_latency.png`。
