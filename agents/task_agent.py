@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import statistics
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -34,7 +35,14 @@ from llm.llm_base import BaseLLM
 
 logger = get_logger("blkmac.agent")
 
-__all__ = ["SubTask", "AgentResult", "TaskAgent", "DOMAINS", "make_agent_pool"]
+__all__ = [
+    "SubTask",
+    "AgentResult",
+    "TaskAgent",
+    "DOMAINS",
+    "make_agent_pool",
+    "default_capability_profiles",
+]
 
 # 题库与能力向量共用的领域集合
 DOMAINS = ("math", "code", "logic", "knowledge", "writing")
@@ -119,6 +127,7 @@ class TaskAgent:
         private_key: Any = None,
         host: str | None = None,
         port: int = 0,
+        error_group: str | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.llm = llm
@@ -126,6 +135,10 @@ class TaskAgent:
         self.capabilities = {d: 0.5 for d in DOMAINS}
         if capabilities:
             self.capabilities.update({k: float(v) for k, v in capabilities.items()})
+
+        # 错误潜因子分组：同一组的 Agent 在 MockLLM 层共享「是否幻觉/错成什么」，
+        # 用于构造「相关错误」这一实验变量。None（默认）= 不启用，行为与既有一致。
+        self.error_group = error_group
 
         # 密钥惰性生成：2048 位 RSA 生成要几百毫秒，而 direct 模式（进程内直接
         # 调用）根本用不到密钥。只有真正走加密 TCP 时才付这个代价。
@@ -148,6 +161,12 @@ class TaskAgent:
         self.trust_last_event = "initial"
         self.trust_history: list[dict[str, Any]] = []
         self.results: list[AgentResult] = []
+
+        # per-domain Beta 可靠性后验（先验 α=β=1 → 均匀），以及逐领域的
+        # 「是否出错」指示序列（0=对，1=错/幻觉），供错误相关性估计使用。
+        self.alpha: dict[str, float] = {d: settings.BETA_PRIOR_ALPHA for d in DOMAINS}
+        self.beta: dict[str, float] = {d: settings.BETA_PRIOR_BETA for d in DOMAINS}
+        self.error_flags: dict[str, list[int]] = {d: [] for d in DOMAINS}
 
     # -- 属性 -------------------------------------------------------------
 
@@ -204,10 +223,69 @@ class TaskAgent:
             }
         )
 
+    # -- per-domain 可靠性（Beta 后验）与错误相关性 -------------------------
+
+    def _ensure_domain(self, domain: str) -> str:
+        """保证该领域有后验与错误指示序列；未知领域按 knowledge 之外的键单独建档。"""
+        if domain not in self.alpha:
+            self.alpha[domain] = settings.BETA_PRIOR_ALPHA
+            self.beta[domain] = settings.BETA_PRIOR_BETA
+            self.error_flags[domain] = []
+        return domain
+
+    def update_reliability(self, result: AgentResult) -> None:
+        """按领域更新 Beta 后验；错误/幻觉记 beta，成功记 alpha。
+
+        与标量 ``trust_score`` 的区别：标量信任把所有领域混在一起，无法表达
+        「该 Agent 在 math 可靠、在 code 不可靠」这类领域差异。
+        """
+        domain = self._ensure_domain(result.domain)
+        if (not result.ok) or result.hallucinated:
+            self.beta[domain] += 1.0
+        else:
+            self.alpha[domain] += 1.0
+        self.error_flags[domain].append(
+            0 if (result.ok and not result.hallucinated) else 1
+        )
+
+    def reliability(self, domain: str) -> float:
+        """该领域的后验成功率 = α/(α+β)。无观测时退回均匀先验。"""
+        alpha = self.alpha.get(domain, settings.BETA_PRIOR_ALPHA)
+        beta = self.beta.get(domain, settings.BETA_PRIOR_BETA)
+        total = alpha + beta
+        if total <= 0:
+            return 0.5
+        return alpha / total
+
+    def error_correlation(self, other: "TaskAgent", domain: str) -> float:
+        """per-domain 的错误相关性估计。
+
+        冷启动（观测样本不足）：用**能力向量余弦相似度**作先验——两个 math 都弱的
+        Agent 能力向量相近 → 先验相关性高，无需额外数据即可表达「同质能力会同错」。
+        热启动：对两边最近的错误指示向量求 Pearson 相关系数。
+        """
+        a = self.error_flags.get(domain, [])
+        b = other.error_flags.get(domain, [])
+        sampleCount = min(len(a), len(b))
+        minSamples = max(1, int(settings.CORRELATION_MIN_SAMPLES))
+
+        if sampleCount < minSamples:
+            dot = sum(self.capabilities[d] * other.capabilities[d] for d in DOMAINS)
+            normA = sum(v * v for v in self.capabilities.values()) ** 0.5
+            normB = sum(v * v for v in other.capabilities.values()) ** 0.5
+            if normA <= 0.0 or normB <= 0.0:
+                return 0.0
+            return max(0.0, min(1.0, dot / (normA * normB)))
+
+        x, y = a[-sampleCount:], b[-sampleCount:]
+        # 任一侧错误指示恒定（全错或全对）时 Pearson 无定义，视为「无相关证据」
+        if len(set(x)) < 2 or len(set(y)) < 2:
+            return 0.0
+        return max(-1.0, min(1.0, statistics.correlation(x, y)))
+
     @property
     def avg_latency_ms(self) -> float:
         return self.total_latency_ms / self.completed if self.completed else 0.0
-
     @property
     def task_count(self) -> int:
         """累计承接的任务数——阶段3「各 agent 任务量」指标。"""
@@ -249,6 +327,9 @@ class TaskAgent:
                 # MockLLM 据此决定幻觉概率，真实后端会忽略该参数
                 competence=self.capability(subtask.domain),
                 difficulty=subtask.difficulty,
+                # 错误潜因子分组：同组 Agent 在 MockLLM 层共享幻觉判定，
+                # 从而产生「相关错误」。None 时 MockLLM 行为与既有一致。
+                error_group=self.error_group,
             )
             result = AgentResult(
                 subtask_id=subtask.id,
@@ -292,6 +373,7 @@ class TaskAgent:
             if result.hallucinated:
                 self.hallucinations += 1
             self.update_trust(result)
+            self.update_reliability(result)
             self.results.append(result)
 
         return result
@@ -352,6 +434,8 @@ class TaskAgent:
             "trust_last_event": self.trust_last_event,
             "avg_latency_ms": round(self.avg_latency_ms, 2),
             "capabilities": dict(self.capabilities),
+            "reliability": {d: round(self.reliability(d), 4) for d in DOMAINS},
+            "error_group": self.error_group,
         }
 
     def reset(self) -> None:
@@ -367,6 +451,9 @@ class TaskAgent:
             self.trust_last_event = "initial"
             self.trust_history.clear()
             self.results.clear()
+            self.alpha = {d: settings.BETA_PRIOR_ALPHA for d in DOMAINS}
+            self.beta = {d: settings.BETA_PRIOR_BETA for d in DOMAINS}
+            self.error_flags = {d: [] for d in DOMAINS}
         self.llm.reset_stats()
 
     def __repr__(self) -> str:
@@ -390,26 +477,46 @@ _CAPABILITY_PROFILES: list[dict[str, float]] = [
 ]
 
 
+def default_capability_profiles() -> list[dict[str, float]]:
+    """预设专家画像的副本。
+
+    实验构造「相关性档位」时按画像复用 Agent（同画像 → 同错误组 → 相关错误），
+    因此需要一份不会被外部改动的副本。
+    """
+    return [dict(profile) for profile in _CAPABILITY_PROFILES]
+
+
 def make_agent_pool(
     count: int,
     llm_factory,
     id_prefix: str = "agent",
     host: str | None = None,
+    profiles: list[dict[str, float]] | None = None,
+    error_groups: list[str | None] | None = None,
 ) -> list[TaskAgent]:
     """按预设的专家画像批量创建 Agent。
 
     :param llm_factory: ``callable(agent_index) -> BaseLLM``，
         每个 Agent 拿独立的 LLM 实例，统计互不干扰。
+    :param profiles: 可选的能力画像列表（第 i 个 Agent 用 ``profiles[i]``）。
+        默认按 ``_CAPABILITY_PROFILES`` 轮转，保持与既有一致。
+    :param error_groups: 可选的错误潜因子分组标签列表；``None``（默认）表示
+        不启用分组，此时 MockLLM 行为与既有完全一致。
     """
     agents = []
     for i in range(count):
-        profile = _CAPABILITY_PROFILES[i % len(_CAPABILITY_PROFILES)]
+        if profiles is not None:
+            profile = dict(profiles[i % len(profiles)])
+        else:
+            profile = dict(_CAPABILITY_PROFILES[i % len(_CAPABILITY_PROFILES)])
+        group = None if error_groups is None else error_groups[i % len(error_groups)]
         agents.append(
             TaskAgent(
                 agent_id=f"{id_prefix}-{i + 1}",
                 llm=llm_factory(i),
-                capabilities=dict(profile),
+                capabilities=profile,
                 host=host,
+                error_group=group,
             )
         )
     return agents

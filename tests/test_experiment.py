@@ -333,5 +333,94 @@ class TestCli(unittest.TestCase):
             self.assertTrue((Path(tmp) / "metrics.csv").exists())
 
 
+class TestRedundantVerification(unittest.TestCase):
+    """D3/D4：预算内冗余验证在实验层的接入、方法口径与成本统计。"""
+
+    def _runner(self, **kwargs) -> mc.ExperimentRunner:
+        questions = mc.load_dataset()[:4]
+        return mc.ExperimentRunner(
+            questions, agent_count=4, seed=20250728, use_chain=False, **kwargs
+        )
+
+    def test_baseline_method_forces_zero_budget(self):
+        """B0 必须强制关掉冗余，保证与既有 C 组口径完全一致。"""
+        runner = self._runner(redundancy_budget=8, method="baseline")
+        self.assertEqual(runner.redundancy_budget, 0)
+
+    def test_method_selects_scheduling_and_aggregation(self):
+        proposed = self._runner(redundancy_budget=4, method="proposed")
+        self.assertTrue(proposed.correlation_aware)
+        self.assertEqual(proposed.redundancy_strategy, "greedy")
+
+        reputation = self._runner(redundancy_budget=4, method="reputation")
+        self.assertFalse(reputation.correlation_aware)
+        self.assertEqual(reputation.redundancy_strategy, "greedy")
+
+        randomMethod = self._runner(redundancy_budget=4, method="random")
+        self.assertEqual(randomMethod.redundancy_strategy, "random")
+
+    def test_error_group_modes(self):
+        self.assertIsNone(self._runner(correlation_level="none").resolve_error_groups())
+        self.assertEqual(
+            self._runner(correlation_level="independent").resolve_error_groups(),
+            ["g0", "g1", "g2", "g3"],
+        )
+        self.assertEqual(
+            self._runner(correlation_level="pairs").resolve_error_groups(),
+            ["g0", "g0", "g1", "g1"],
+        )
+        self.assertEqual(
+            self._runner(correlation_level="all").resolve_error_groups(), ["g0"] * 4
+        )
+
+    def test_profiles_align_with_error_groups(self):
+        """分组必须与画像对齐：同画像 → 同组，冷启动先验才预测得到相关性。"""
+        self.assertIsNone(self._runner(correlation_level="none").resolve_profiles())
+
+        independent = self._runner(correlation_level="independent").resolve_profiles()
+        self.assertEqual(len(independent), 4)
+        self.assertEqual(len({tuple(sorted(p.items())) for p in independent}), 4)
+
+        pairs = self._runner(correlation_level="pairs").resolve_profiles()
+        self.assertEqual(pairs[0], pairs[1])
+        self.assertEqual(pairs[2], pairs[3])
+        self.assertNotEqual(pairs[0], pairs[2])
+
+        everyone = self._runner(correlation_level="all").resolve_profiles()
+        self.assertEqual(len({tuple(sorted(p.items())) for p in everyone}), 1)
+
+    def test_invalid_error_group_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._runner(correlation_level="bogus").resolve_error_groups()
+
+    def test_baseline_matches_run_without_new_options(self):
+        """回归护栏：不传新参数 与 method=baseline 必须给出同一结果。"""
+        plain = self._runner().run(["c"])["c"]
+        baseline = self._runner(method="baseline", correlation_level="none").run(["c"])["c"]
+        self.assertEqual(plain.summary()["accuracy"], baseline.summary()["accuracy"])
+        self.assertEqual(plain.summary()["hallucinations"], baseline.summary()["hallucinations"])
+        self.assertEqual(baseline.redundant_calls_total, 0)
+
+    def test_proposed_spends_budget_and_records_cost(self):
+        result = self._runner(redundancy_budget=3, method="proposed").run(["c"])["c"]
+        self.assertGreater(result.redundant_calls_total, 0)
+        self.assertEqual(result.redundancy_budget, 3)
+        self.assertTrue(result.correlation_aware)
+
+    def test_error_group_run_is_reproducible(self):
+        first = self._runner(redundancy_budget=2, correlation_level="all").run(["c"])["c"]
+        second = self._runner(redundancy_budget=2, correlation_level="all").run(["c"])["c"]
+        self.assertEqual(
+            [r.final_answer for r in first.records],
+            [r.final_answer for r in second.records],
+        )
+
+    def test_error_acceptance_rate_is_complement_of_accuracy(self):
+        result = self._runner().run(["c"])["c"]
+        self.assertAlmostEqual(
+            result.error_acceptance_rate, 1.0 - result.accuracy, places=6
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

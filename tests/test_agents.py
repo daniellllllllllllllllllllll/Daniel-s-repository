@@ -10,7 +10,7 @@ import unittest
 from agents import controller_agent as ca
 from agents import task_agent as ta
 from blockchain.chain_client import NullLedger
-from llm.llm_api import MockLLM
+from llm.llm_api import MockLLM, TaskKind
 
 KB = {f"题目{i}": str(i) for i in range(50)}
 
@@ -513,6 +513,357 @@ class TestTcpTransport(unittest.TestCase):
         assignment = ca.Assignment(ta.SubTask("S1", "d"), pool[0].agent_id, 1.0)
         with self.assertRaises(RuntimeError):
             ctrl.dispatch(assignment)
+
+
+class TestReliabilityPosterior(unittest.TestCase):
+    """C1：per-domain Beta 后验要能表达「math 可靠、code 不可靠」的领域差异。"""
+
+    def setUp(self):
+        self.agent = ta.TaskAgent("a", _llm(), capabilities={"math": 0.9})
+
+    def _result(self, domain: str, **kwargs) -> ta.AgentResult:
+        return ta.AgentResult("S1", "a", kwargs.pop("answer", "x"), domain=domain, **kwargs)
+
+    def test_prior_is_uniform(self):
+        for domain in ta.DOMAINS:
+            self.assertAlmostEqual(self.agent.reliability(domain), 0.5, places=6)
+
+    def test_success_increases_alpha(self):
+        self.agent.update_reliability(self._result("math"))
+        self.assertEqual(self.agent.alpha["math"], 2.0)
+        self.assertEqual(self.agent.beta["math"], 1.0)
+        self.assertAlmostEqual(self.agent.reliability("math"), 2.0 / 3.0, places=6)
+        self.assertEqual(self.agent.error_flags["math"], [0])
+
+    def test_hallucination_and_failure_increase_beta(self):
+        self.agent.update_reliability(self._result("math", hallucinated=True))
+        self.agent.update_reliability(self._result("math", answer="", error="boom"))
+        self.assertEqual(self.agent.beta["math"], 3.0)
+        self.assertEqual(self.agent.alpha["math"], 1.0)
+        self.assertEqual(self.agent.error_flags["math"], [1, 1])
+
+    def test_domains_are_independent(self):
+        self.agent.update_reliability(self._result("math"))
+        self.agent.update_reliability(self._result("code", answer="", error="boom"))
+        self.assertGreater(self.agent.reliability("math"), 0.5)
+        self.assertLess(self.agent.reliability("code"), 0.5)
+
+    def test_execute_updates_posterior(self):
+        self.agent.execute(ta.SubTask("S1", "题目1", domain="math"))
+        self.assertEqual(len(self.agent.error_flags["math"]), 1)
+        self.assertEqual(self.agent.alpha["math"] + self.agent.beta["math"], 3.0)
+
+    def test_reset_clears_posterior(self):
+        self.agent.execute(ta.SubTask("S1", "题目1", domain="math"))
+        self.agent.reset()
+        self.assertEqual(self.agent.alpha["math"], 1.0)
+        self.assertEqual(self.agent.beta["math"], 1.0)
+        self.assertEqual(self.agent.error_flags["math"], [])
+
+    def test_stats_reports_reliability(self):
+        stats = self.agent.stats()
+        self.assertIn("reliability", stats)
+        self.assertEqual(set(stats["reliability"]), set(ta.DOMAINS))
+
+
+class TestErrorCorrelation(unittest.TestCase):
+    """C2：冷启动用能力向量先验，热启动用 Pearson。"""
+
+    STRONG = {"math": 0.95, "code": 0.35, "logic": 0.75, "knowledge": 0.40, "writing": 0.25}
+    WEAK_MATH = {"math": 0.20, "code": 0.25, "logic": 0.40, "knowledge": 0.95, "writing": 0.95}
+
+    def _agent(self, agent_id: str, flags=None, capabilities=None) -> ta.TaskAgent:
+        agent = ta.TaskAgent(agent_id, _llm(), capabilities=capabilities)
+        if flags is not None:
+            agent.error_flags["math"] = list(flags)
+        return agent
+
+    def test_cold_start_matches_capability_cosine(self):
+        a = self._agent("a", capabilities=self.STRONG)
+        b = self._agent("b", capabilities=self.STRONG)
+        c = self._agent("c", capabilities=self.WEAK_MATH)
+        self.assertAlmostEqual(a.error_correlation(b, "math"), 1.0, places=6)
+        self.assertLess(a.error_correlation(c, "math"), a.error_correlation(b, "math"))
+
+    def test_hot_start_pearson(self):
+        flags = [0, 1, 0, 1, 0, 1]
+        a = self._agent("a", flags=flags)
+        b = self._agent("b", flags=flags)
+        c = self._agent("c", flags=[1, 0, 1, 0, 1, 0])
+        self.assertAlmostEqual(a.error_correlation(b, "math"), 1.0, places=6)
+        self.assertAlmostEqual(a.error_correlation(c, "math"), -1.0, places=6)
+
+    def test_constant_indicator_is_neutral(self):
+        """全错/全对的指示向量上 Pearson 无定义，应返回 0 而不是抛异常。"""
+        a = self._agent("a", flags=[1, 1, 1, 1, 1])
+        b = self._agent("b", flags=[0, 1, 0, 1, 0])
+        self.assertEqual(a.error_correlation(b, "math"), 0.0)
+
+    def test_correlation_is_symmetric(self):
+        a = self._agent("a", flags=[0, 1, 0, 1, 0, 1])
+        b = self._agent("b", flags=[0, 0, 1, 1, 0, 1])
+        self.assertAlmostEqual(
+            a.error_correlation(b, "math"), b.error_correlation(a, "math"), places=6
+        )
+
+
+class TestErrorGroupLatentFactor(unittest.TestCase):
+    """D5：同组 Agent 共享「错误潜因子」，从而产生可控的相关错误。"""
+
+    def _llm_at(self, competence: float) -> MockLLM:
+        return MockLLM(
+            seed=7, knowledge_base=KB, hallucination_rate=0.6, competence=competence
+        )
+
+    def test_same_group_shares_wrong_answer(self):
+        weak, strong = self._llm_at(0.1), self._llm_at(0.5)
+        shared = 0
+        for question in KB:
+            low = weak.generate(
+                question, kind=TaskKind.ANSWER, competence=0.1, difficulty=1, error_group="G"
+            )
+            high = strong.generate(
+                question, kind=TaskKind.ANSWER, competence=0.5, difficulty=1, error_group="G"
+            )
+            if low.hallucinated and high.hallucinated:
+                # 同一个潜因子抽样 → 必须错成同一个答案
+                self.assertEqual(low.text, high.text)
+                shared += 1
+        self.assertGreater(shared, 0, "没有出现共同幻觉，测试样本不足")
+
+    def test_same_group_shares_across_different_agent_seeds(self):
+        """不同 Agent 的 seed 不同（实验里是 seed+salt），潜因子仍必须共享。
+
+        这是真机实验里踩过的坑：若把 ``self.seed`` 掺进潜因子随机源，
+        同组 Agent 会抽到完全不同的随机流，相关性档位就形同虚设。
+        """
+        first = MockLLM(seed=11, knowledge_base=KB, hallucination_rate=0.6, competence=0.3)
+        second = MockLLM(seed=99, knowledge_base=KB, hallucination_rate=0.6, competence=0.3)
+        for question in KB:
+            left = first.generate(
+                question, kind=TaskKind.ANSWER, competence=0.3, difficulty=1, error_group="G"
+            )
+            right = second.generate(
+                question, kind=TaskKind.ANSWER, competence=0.3, difficulty=1, error_group="G"
+            )
+            # 能力相同 + 同组 → 幻觉判定与错答都必须逐字一致
+            self.assertEqual(left.hallucinated, right.hallucinated)
+            self.assertEqual(left.text, right.text)
+
+    def test_unseeded_group_agents_stay_independent(self):
+        """不同组（无潜因子共享）时，两个同能力 Agent 不应逐题一致。"""
+        first = MockLLM(seed=11, knowledge_base=KB, hallucination_rate=0.6, competence=0.3)
+        second = MockLLM(seed=99, knowledge_base=KB, hallucination_rate=0.6, competence=0.3)
+        outcomes = [
+            (
+                first.generate(
+                    question, kind=TaskKind.ANSWER, competence=0.3, difficulty=1
+                ).hallucinated,
+                second.generate(
+                    question, kind=TaskKind.ANSWER, competence=0.3, difficulty=1
+                ).hallucinated,
+            )
+            for question in KB
+        ]
+        self.assertTrue(
+            any(a != b for a, b in outcomes), "未启用分组时不应逐题完全一致"
+        )
+
+    def test_different_groups_do_not_share_wrong_answer(self):
+        weak, strong = self._llm_at(0.1), self._llm_at(0.5)
+        differs = 0
+        for question in KB:
+            low = weak.generate(
+                question, kind=TaskKind.ANSWER, competence=0.1, difficulty=1, error_group="G1"
+            )
+            high = strong.generate(
+                question, kind=TaskKind.ANSWER, competence=0.5, difficulty=1, error_group="G2"
+            )
+            if low.hallucinated and high.hallucinated and low.text != high.text:
+                differs += 1
+        self.assertGreater(differs, 0, "不同组之间不应共享错答")
+
+    def test_default_group_keeps_legacy_determinism(self):
+        """error_group=None（默认）时必须与既有确定性逐字符一致。"""
+        first = self._llm_at(0.3).generate(
+            "题目12", kind=TaskKind.ANSWER, competence=0.3, difficulty=2
+        )
+        second = self._llm_at(0.3).generate(
+            "题目12", kind=TaskKind.ANSWER, competence=0.3, difficulty=2, error_group=None
+        )
+        self.assertEqual(first.text, second.text)
+        self.assertEqual(first.hallucinated, second.hallucinated)
+
+    def test_make_agent_pool_defaults_to_no_group(self):
+        pool = ta.make_agent_pool(3, lambda i: _llm())
+        self.assertTrue(all(a.error_group is None for a in pool))
+
+    def test_make_agent_pool_assigns_groups_and_profiles(self):
+        profile = {"math": 0.5, "code": 0.5, "logic": 0.5, "knowledge": 0.5, "writing": 0.5}
+        pool = ta.make_agent_pool(
+            3,
+            lambda i: _llm(),
+            profiles=[profile],
+            error_groups=["G", "G", None],
+        )
+        self.assertEqual([a.error_group for a in pool], ["G", "G", None])
+        self.assertEqual(pool[0].capabilities["math"], 0.5)
+
+
+class TestRedundancyAggregation(unittest.TestCase):
+    """D3：去相关加权投票。"""
+
+    def setUp(self):
+        # 两个能力完全相同的 Agent → 冷启动相关性 = 1（同质），第三个方向不同
+        self.alpha = ta.TaskAgent("a1", _llm(), capabilities=TestErrorCorrelation.STRONG)
+        self.beta = ta.TaskAgent("a2", _llm(), capabilities=TestErrorCorrelation.STRONG)
+        self.gamma = ta.TaskAgent("a3", _llm(), capabilities=TestErrorCorrelation.WEAK_MATH)
+        self.ctrl = ca.ControllerAgent(
+            _llm(), [self.alpha, self.beta, self.gamma], ledger=NullLedger()
+        )
+        self.subtask = ta.SubTask("S1", "题目1", domain="math")
+
+    def _result(self, agent_id: str, answer: str) -> ta.AgentResult:
+        return ta.AgentResult("S1", agent_id, answer, domain="math")
+
+    def test_empty_results(self):
+        self.assertEqual(self.ctrl.aggregate_redundant(self.subtask, []), "")
+
+    def test_single_result_passes_through(self):
+        self.assertEqual(
+            self.ctrl.aggregate_redundant(self.subtask, [self._result("a1", "X")]), "X"
+        )
+
+    def test_correlated_pair_loses_to_independent_agent(self):
+        """a1/a2 同质（相关性≈1），a3 独立且后验更可靠 → 去相关投票选出 a3 的答案。
+
+        朴素信誉加权（相关性=0）会让同质的两票压过一票；把 a2 的相关性折扣打掉后，
+        a3 的证据才浮出来。
+        """
+        self.gamma.alpha["math"] = 8.0
+        self.gamma.beta["math"] = 2.0  # 后验 0.8 > a1/a2 的 0.5
+        results = [
+            self._result("a1", "WRONG"),
+            self._result("a2", "WRONG"),
+            self._result("a3", "RIGHT"),
+        ]
+        self.assertEqual(self.ctrl.aggregate_redundant(self.subtask, results), "RIGHT")
+        # 关掉相关性折扣 → 退化为朴素信誉加权，同质的两票（各 0.5）压过一票（0.8）
+        self.assertEqual(
+            self.ctrl.aggregate_redundant(self.subtask, results, correlationAware=False),
+            "WRONG",
+        )
+
+    def test_skips_failed_and_empty_results(self):
+        results = [
+            self._result("a1", ""),
+            ta.AgentResult("S1", "a2", "", domain="math", error="boom"),
+            self._result("a3", "RIGHT"),
+        ]
+        self.assertEqual(self.ctrl.aggregate_redundant(self.subtask, results), "RIGHT")
+
+    def test_all_zero_weight_falls_back_to_majority(self):
+        """相关性全为 1 时权重归零，应退回多数投票而不是随意取一个。"""
+        self.alpha.error_flags["math"] = [1, 0, 1, 0, 1]
+        self.beta.error_flags["math"] = [1, 0, 1, 0, 1]
+        self.ctrl.correlation_aware = True
+        results = [
+            self._result("a1", "RIGHT"),
+            self._result("a2", "WRONG"),
+            self._result("a3", "RIGHT"),
+        ]
+        self.assertEqual(self.ctrl.aggregate_redundant(self.subtask, results), "RIGHT")
+
+
+class TestRedundancyScheduling(unittest.TestCase):
+    """D4：预算内贪心加验证，边际收益按相关性打折。"""
+
+    def _controller(self) -> ca.ControllerAgent:
+        """用项目自带的 4 个专家画像：能力各异 → 两两相关性 < 1，边际收益为正。"""
+        pool = ta.make_agent_pool(4, lambda i: _llm())
+        return ca.ControllerAgent(_llm(), pool, ledger=NullLedger())
+
+    def _assignments(self, count: int = 3) -> list:
+        subtasks = [
+            ta.SubTask(f"S{i + 1}", f"题目{i + 1}", domain="math", difficulty=2)
+            for i in range(count)
+        ]
+        return [
+            ca.Assignment(subtask=s, agent_id="agent-1", score=1.0) for s in subtasks
+        ]
+
+    def test_zero_budget_returns_empty(self):
+        ctrl = self._controller()
+        self.assertEqual(ctrl.add_redundancy(self._assignments(), 0), {})
+
+    def test_respects_budget(self):
+        ctrl = self._controller()
+        plan = ctrl.add_redundancy(self._assignments(), 5)
+        self.assertEqual(sum(len(v) for v in plan.values()), 5)
+
+    def test_budget_larger_than_capacity_stops(self):
+        """每个子任务最多再补 3 个（共 4 个 Agent），预算再大也不该死循环。"""
+        ctrl = self._controller()
+        plan = ctrl.add_redundancy(self._assignments(2), 99)
+        self.assertEqual(sum(len(v) for v in plan.values()), 2 * 3)
+
+    def test_never_picks_same_agent_twice(self):
+        ctrl = self._controller()
+        plan = ctrl.add_redundancy(self._assignments(), 8)
+        for subtaskId, extra in plan.items():
+            chain = ["agent-1"] + extra
+            self.assertEqual(len(chain), len(set(chain)), f"{subtaskId} 出现重复 Agent")
+
+    def test_correlation_discount_blocks_useless_redundancy(self):
+        """同质 Agent 之间相关性≈1 → Proposed 不再浪费预算，而 B2（忽略相关性）会。"""
+        pool = ta.make_agent_pool(
+            4, lambda i: _llm(), profiles=[TestErrorCorrelation.STRONG] * 4
+        )
+        ctrl = ca.ControllerAgent(_llm(), pool, ledger=NullLedger())
+
+        self.assertEqual(ctrl.add_redundancy(self._assignments(1), 1), {})
+        self.assertEqual(ctrl.redundancy_trace, [])
+
+        unaware = ctrl.add_redundancy(self._assignments(1), 1, correlationAware=False)
+        self.assertEqual(set(unaware), {"S1"})
+        self.assertAlmostEqual(ctrl.redundancy_trace[0]["correlation"], 0.0, places=6)
+        self.assertGreater(ctrl.redundancy_trace[0]["gain"], 0.0)
+
+    def test_correlation_discount_reduces_gain_on_distinct_profiles(self):
+        """不同画像上：相关性感知的边际收益必须严格小于忽略相关性时。"""
+        ctrl = self._controller()
+        ctrl.add_redundancy(self._assignments(1), 1)
+        aware = dict(ctrl.redundancy_trace[0])
+        ctrl.add_redundancy(self._assignments(1), 1, correlationAware=False)
+        unaware = dict(ctrl.redundancy_trace[0])
+
+        self.assertGreater(aware["correlation"], 0.0)
+        self.assertAlmostEqual(unaware["correlation"], 0.0, places=6)
+        self.assertLess(aware["gain"], unaware["gain"])
+        self.assertAlmostEqual(unaware["gain"], 0.25, places=6)  # 0.5 × 0.5 × 1
+
+    def test_run_with_budget_zero_behaves_like_baseline(self):
+        poolA = ta.make_agent_pool(4, lambda i: _llm())
+        ctrlA = ca.ControllerAgent(_llm(), poolA, ledger=NullLedger())
+        traceA = ctrlA.run("题目3", "Q1")
+
+        poolB = ta.make_agent_pool(4, lambda i: _llm())
+        ctrlB = ca.ControllerAgent(_llm(), poolB, ledger=NullLedger(), redundancy_budget=0)
+        traceB = ctrlB.run("题目3", "Q1")
+
+        self.assertEqual(traceA.final_answer, traceB.final_answer)
+        self.assertEqual(traceA.redundancy, [])
+        self.assertEqual(traceB.redundancy, [])
+
+    def test_run_with_budget_adds_second_opinions(self):
+        pool = ta.make_agent_pool(4, lambda i: _llm())
+        ctrl = ca.ControllerAgent(_llm(), pool, ledger=NullLedger(), redundancy_budget=2)
+        trace = ctrl.run("题目3", "Q1")
+        self.assertEqual(len(trace.redundancy), 2)
+        # 预算花掉后，Agent 调用次数应比单 Agent 直答多出 2 次
+        primaryCalls = sum(1 for r in trace.results)
+        self.assertEqual(primaryCalls, len(trace.results))
+        self.assertTrue(all(item["subtask_id"] for item in trace.redundancy))
 
 
 if __name__ == "__main__":

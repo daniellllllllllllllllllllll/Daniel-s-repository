@@ -166,6 +166,21 @@ class Settings:
         default_factory=lambda: get_float("TRUST_FAILURE_PENALTY", 0.1)
     )
 
+    # --- 相关错误感知的可靠调度与验证（PROPOSAL_CORRELATION.md）---
+    # 相关性修正项权重；0.0 = 不启用（消融开关）
+    SCORE_W_CORRELATION: float = field(
+        default_factory=lambda: get_float("SCORE_W_CORRELATION", 0.0)
+    )
+    # 额外 LLM 调用预算；0 = 关闭冗余验证（默认，保证既有 A/B/C 行为不变）
+    REDUNDANCY_BUDGET: int = field(default_factory=lambda: get_int("REDUNDANCY_BUDGET", 0))
+    # error_correlation 从冷启动先验切换到热启动 Pearson 的最小样本数
+    CORRELATION_MIN_SAMPLES: int = field(
+        default_factory=lambda: get_int("CORRELATION_MIN_SAMPLES", 4)
+    )
+    # per-domain Beta 后验先验（α=β=1 → 均匀先验）
+    BETA_PRIOR_ALPHA: float = field(default_factory=lambda: get_float("BETA_PRIOR_ALPHA", 1.0))
+    BETA_PRIOR_BETA: float = field(default_factory=lambda: get_float("BETA_PRIOR_BETA", 1.0))
+
     # --- 日志 ---
     LOG_LEVEL: str = field(default_factory=lambda: get_str("LOG_LEVEL", "INFO").upper())
 

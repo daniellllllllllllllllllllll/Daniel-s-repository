@@ -54,7 +54,13 @@ from typing import Any, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agents.controller_agent import ControllerAgent, ScoreWeights  # noqa: E402
-from agents.task_agent import DOMAINS, SubTask, TaskAgent, make_agent_pool  # noqa: E402
+from agents.task_agent import (  # noqa: E402
+    DOMAINS,
+    SubTask,
+    TaskAgent,
+    default_capability_profiles,
+    make_agent_pool,
+)
 from blockchain.chain_client import ChainError, NullLedger, get_ledger  # noqa: E402
 from config import BASE_DIR, get_logger, settings  # noqa: E402
 from llm.llm_api import MockLLM, get_llm  # noqa: E402
@@ -227,6 +233,8 @@ class QuestionRecord:
     chain_tx: int
     chain_gas: int
     final_answer: str
+    # 冗余验证带来的额外 LLM 调用次数（成本口径；无冗余时恒为 0）
+    redundant_calls: int = 0
 
 
 @dataclass
@@ -243,6 +251,11 @@ class GroupResult:
     scheduling: str = "static"
     trust_aware: bool = False
     difficulty_matching: bool = True
+    # 冗余验证配置（无冗余时 budget=0，行为与既有 A/B/C 一致）
+    redundancy_budget: int = 0
+    correlation_aware: bool = True
+    correlation_level: str = "none"
+    method: str = "baseline"
 
     # -- 汇总指标 ---------------------------------------------------------
 
@@ -292,6 +305,16 @@ class GroupResult:
     def chain_gas_total(self) -> int:
         return sum(r.chain_gas for r in self.records)
 
+    @property
+    def redundant_calls_total(self) -> int:
+        """冗余验证实际花掉的额外 LLM 调用次数（成本指标）。"""
+        return sum(r.redundant_calls for r in self.records)
+
+    @property
+    def error_acceptance_rate(self) -> float:
+        """错误接受率：最终聚合答案仍然错误的比例（本方案的核心指标）。"""
+        return 1.0 - self.accuracy
+
     def summary(self) -> dict:
         return {
             "group": self.group,
@@ -299,6 +322,7 @@ class GroupResult:
             "questions": self.total,
             "correct": sum(r.correct for r in self.records),
             "accuracy": round(self.accuracy, 4),
+            "error_acceptance_rate": round(self.error_acceptance_rate, 4),
             "hallucinations": self.hallucinations,
             "avg_latency_ms": round(self.avg_latency_ms, 2),
             "avg_llm_latency_ms": round(self.avg_llm_latency_ms, 2),
@@ -314,6 +338,11 @@ class GroupResult:
             "scheduling": self.scheduling,
             "trust_aware": self.trust_aware,
             "difficulty_matching": self.difficulty_matching,
+            "method": self.method,
+            "redundancy_budget": self.redundancy_budget,
+            "correlation_aware": self.correlation_aware,
+            "correlation_level": self.correlation_level,
+            "redundant_calls": self.redundant_calls_total,
         }
 
 
@@ -338,6 +367,10 @@ class ExperimentRunner:
         base_url: str | None = None,
         trust_aware: bool = False,
         difficulty_matching: bool = True,
+        redundancy_budget: int = 0,
+        correlation_aware: bool = True,
+        correlation_level: str = "none",
+        method: str = "baseline",
     ) -> None:
         self.questions = list(questions)
         self.agent_count = agent_count or settings.AGENT_COUNT
@@ -353,6 +386,32 @@ class ExperimentRunner:
         self.base_url = base_url or settings.LLM_BASE_URL
         self.trust_aware = trust_aware
         self.difficulty_matching = difficulty_matching
+        # --- 相关错误感知的可靠调度与验证（PROPOSAL_CORRELATION.md）---
+        # 默认全部关闭/中性：redundancy_budget=0 且 correlation_level="none" 时
+        # 运行时行为与既有 A/B/C 完全一致。
+        self.method = method
+        budget = max(0, int(redundancy_budget))
+        if method == "baseline":
+            # B0：无冗余。强制预算为 0，保证与既有 C 组口径一致。
+            budget = 0
+            correlation_aware = True
+            redundancy_strategy = "greedy"
+        elif method == "random":
+            # B1：随机加验证 + 多数投票（权重全相同 → 等价多数投票）
+            correlation_aware = False
+            redundancy_strategy = "random"
+        elif method == "reputation":
+            # B2：风险最高的子任务优先，但**忽略错误相关性**（强基线）
+            correlation_aware = False
+            redundancy_strategy = "greedy"
+        else:
+            # Proposed：相关性感知的边际收益贪心 + 去相关加权投票
+            correlation_aware = True
+            redundancy_strategy = "greedy"
+        self.redundancy_budget = budget
+        self.correlation_aware = bool(correlation_aware)
+        self.redundancy_strategy = redundancy_strategy
+        self.correlation_level = str(correlation_level).lower()
 
         self.use_chain = settings.CHAIN_ENABLED if use_chain is None else use_chain
 
@@ -383,11 +442,60 @@ class ExperimentRunner:
             hallucination_rate=settings.MOCK_HALLUCINATION_RATE,
         )
 
+    def resolve_error_groups(self) -> list[str | None] | None:
+        """把相关性档位展开成逐 Agent 的错误分组标签。
+
+        分组与能力画像**对齐**（同画像 → 同组），这样冷启动的相关性先验
+        （能力向量余弦）才真正预测得到实际的错误相关性——这是方案 D5 的关键设计。
+
+        * ``none``        —— 不分组（默认）：行为与既有完全一致；
+        * ``independent`` —— 4 个互不相同画像，各自一组 → 错误彼此独立；
+        * ``pairs``       —— 2 个画像各用 2 次 → 组内相关、组间独立（中等相关）；
+        * ``all``         —— 4 个 Agent 同画像同组 → 高度相关。
+        """
+        mode = self.correlation_level
+        count = self.agent_count
+        if mode in {"none", "off", ""}:
+            return None
+        if count <= 1:
+            return None
+        if mode == "independent":
+            return [f"g{i}" for i in range(count)]
+        if mode == "pairs":
+            return [f"g{i // 2}" for i in range(count)]
+        if mode == "all":
+            return ["g0"] * count
+        raise ValueError(
+            f"correlation_level 只能是 none/independent/pairs/all，收到 {self.correlation_level!r}"
+        )
+
+    def resolve_profiles(self) -> list[dict[str, float]] | None:
+        """把相关性档位展开成逐 Agent 的能力画像（与错误分组一一对应）。"""
+        mode = self.correlation_level
+        count = self.agent_count
+        if mode in {"none", "off", ""}:
+            return None  # 默认轮转 4 个互不相同的专家画像
+        if count <= 1:
+            return None
+        base = default_capability_profiles()
+        if mode == "independent":
+            # 画像互不相同：Agent i 用画像 i（数量超出时轮转复用，但大概率不重复）
+            return [base[i % len(base)] for i in range(count)]
+        if mode == "pairs":
+            first, second = base[0], base[1]
+            pattern = [first, first, second, second]
+            return [dict(pattern[i % len(pattern)]) for i in range(count)]
+        if mode == "all":
+            return [dict(base[0]) for _ in range(count)]
+        return None
+
     def _make_pool(self) -> list[TaskAgent]:
         """构造 Agent 池。三组共用同一套能力画像与种子。"""
         return make_agent_pool(
             self.agent_count,
             llm_factory=lambda i: self._make_llm(competence=0.7, salt=i + 1),
+            profiles=self.resolve_profiles(),
+            error_groups=self.resolve_error_groups(),
         )
 
     def _make_ledger(self):
@@ -481,6 +589,10 @@ class ExperimentRunner:
         result.scheduling = self.scheduling
         result.trust_aware = self.trust_aware
         result.difficulty_matching = self.difficulty_matching
+        result.redundancy_budget = self.redundancy_budget
+        result.correlation_aware = self.correlation_aware
+        result.correlation_level = self.correlation_level
+        result.method = self.method
         pool = self._make_pool()
         ledger = self._make_ledger() if use_chain else NullLedger()
 
@@ -493,6 +605,9 @@ class ExperimentRunner:
             scheduling=self.scheduling,
             trust_aware=self.trust_aware,
             difficulty_matching=self.difficulty_matching,
+            redundancy_budget=self.redundancy_budget,
+            correlation_aware=self.correlation_aware,
+            redundancy_strategy=self.redundancy_strategy,
         )
         if transport == "tcp":
             controller.wire_tcp()
@@ -525,6 +640,7 @@ class ExperimentRunner:
                         chain_tx=sum(1 for r in receipts if r.get("status") == "success"),
                         chain_gas=sum(int(r.get("gas_used") or 0) for r in receipts),
                         final_answer=trace.final_answer,
+                        redundant_calls=len(trace.redundancy),
                     )
                 )
                 result.traces.append(trace.to_dict())
@@ -918,6 +1034,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="运行 2.1 消融实验：完整、去 Trust、去自适应、去区块链、去难度匹配",
     )
+    # --- 相关错误感知的可靠调度与验证（PROPOSAL_CORRELATION.md）---
+    p.add_argument(
+        "--redundancy-budget",
+        dest="redundancy_budget",
+        type=int,
+        default=None,
+        help="冗余验证预算（额外 LLM 调用次数）；默认读 REDUNDANCY_BUDGET，0 = 关闭",
+    )
+    p.add_argument(
+        "--method",
+        default="baseline",
+        choices=("baseline", "random", "reputation", "proposed"),
+        help=(
+            "冗余调度方法：baseline=无冗余 / random=随机加验证 / "
+            "reputation=信誉加权（忽略相关性，即 B2）/ proposed=相关性感知"
+        ),
+    )
+    p.add_argument(
+        "--correlation-level",
+        dest="correlation_level",
+        default="none",
+        choices=("none", "independent", "pairs", "all"),
+        help=(
+            "错误相关性档位（同时决定能力画像与错误潜因子分组）："
+            "none=不启用（默认，行为与既有 C 组一致）/ independent=异画像独立 / "
+            "pairs=2 个同画像（中等相关）/ all=全部同画像（高度相关）"
+        ),
+    )
     return p
 
 
@@ -969,6 +1113,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         model=args.model,
         base_url=args.base_url,
         trust_aware=args.trust_aware,
+        redundancy_budget=(
+            settings.REDUNDANCY_BUDGET
+            if args.redundancy_budget is None
+            else args.redundancy_budget
+        ),
+        # baseline=无冗余；proposed=相关性感知；reputation=B2（忽略相关性）
+        correlation_aware=args.method != "reputation",
+        correlation_level=args.correlation_level,
+        method=args.method,
     )
 
     print()

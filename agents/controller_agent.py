@@ -42,8 +42,10 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -59,6 +61,11 @@ from llm.llm_base import BaseLLM
 logger = get_logger("blkmac.controller")
 
 __all__ = ["ScoreWeights", "Assignment", "TaskTrace", "ControllerAgent"]
+
+# 冗余调度中「值得花预算」的最小边际收益。相关性≈1（同质 Agent）时
+# gain = P(失败)×Rel×(1−ρ) 会退化成纯浮点噪声（~1e-17），必须用阈值挡住，
+# 否则会把预算浪费在毫无信息增量的「第三份相同意见」上。
+MIN_REDUNDANCY_GAIN = 1e-9
 
 
 @dataclass
@@ -134,6 +141,9 @@ class TaskTrace:
     hallucination_count: int = 0
     chain_enabled: bool = False
     tamper_detected: int = 0
+    # 冗余验证决策轨迹：每条记录说明「给哪个子任务加了谁、边际收益与相关性多少」，
+    # REDUNDANCY_BUDGET=0 时恒为空列表（不影响既有口径）。
+    redundancy: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -150,6 +160,7 @@ class TaskTrace:
             "hallucination_count": self.hallucination_count,
             "chain_enabled": self.chain_enabled,
             "tamper_detected": self.tamper_detected,
+            "redundancy": self.redundancy,
         }
 
 
@@ -179,6 +190,9 @@ class ControllerAgent:
         trust_aware: bool = False,
         difficulty_matching: bool = True,
         private_key: Any = None,
+        redundancy_budget: int = 0,
+        correlation_aware: bool = True,
+        redundancy_strategy: str = "greedy",
     ) -> None:
         if not agents:
             raise ValueError("至少需要一个 Task Agent")
@@ -199,6 +213,20 @@ class ControllerAgent:
         self.scheduling = scheduling
         self.trust_aware = trust_aware
         self.difficulty_matching = difficulty_matching
+        # 冗余验证预算（额外 LLM 调用次数）。默认 0 = 关闭，行为与既有 A/B/C 一致。
+        self.redundancy_budget = max(0, int(redundancy_budget))
+        # 是否启用「相关性打折」。False = 朴素信誉加权冗余（实验基线 B2），
+        # 与 Proposed 只差这一项，用于隔离相关性建模的贡献。
+        self.correlation_aware = bool(correlation_aware)
+        # 冗余对象的选择策略：greedy=风险感知贪心（Proposed / B2），
+        # random=随机挑子任务与验证者（实验基线 B1）。
+        if redundancy_strategy not in {"greedy", "random"}:
+            raise ValueError(
+                f"redundancy_strategy 只能是 greedy 或 random，收到 {redundancy_strategy!r}"
+            )
+        self.redundancy_strategy = redundancy_strategy
+        # 最近一次 add_redundancy 的决策轨迹（供论文分析与出图）
+        self.redundancy_trace: list[dict] = []
 
         # 与 TaskAgent 同理：direct 模式用不到密钥，惰性生成
         self._private_key = private_key
@@ -463,6 +491,141 @@ class ControllerAgent:
 
         return assignments
 
+    # ------------------------------------------------------------------
+    # 3.5 风险感知的冗余验证调度（Proposed）
+    # ------------------------------------------------------------------
+
+    def add_redundancy(
+        self,
+        assignments: Sequence[Assignment],
+        budget: int,
+        correlationAware: bool = True,
+        strategy: str | None = None,
+    ) -> dict[str, list[str]]:
+        """在预算内为子任务贪心追加第二/第三意见。
+
+        边际收益定义::
+
+            gain(subtask, agent j) = P(当前链失败) × Rel_j(domain) × (1 − ρ_j,链)
+
+        三项分别是「当前还有多大出错概率」「新 Agent 本身多可靠」「它是否只是重复
+        同样的错误」。``correlationAware=False`` 时把 ρ 置 0，即退化为**朴素信誉加权
+        冗余**（实验基线 B2），这样 Proposed 与 B2 只差「相关性打折」一项。
+        ``strategy="random"`` 则不看收益，随机挑子任务与验证者（实验基线 B1）。
+
+        :return: ``{subtask_id: [追加的 agent_id, ...]}``，仅在确有追加时出现该键。
+        """
+        chosenStrategy = strategy or self.redundancy_strategy
+        redundancy: dict[str, list[str]] = {}
+        trace: list[dict] = []
+        if budget <= 0 or not assignments:
+            self.redundancy_trace = trace
+            return redundancy
+
+        if chosenStrategy == "random":
+            plan, trace = self._random_redundancy(assignments, budget)
+            self.redundancy_trace = trace
+            return plan
+
+        remaining = int(budget)
+        while remaining > 0:
+            best: tuple[float, str, str, float, float] | None = None
+            for assignment in assignments:
+                subtask = assignment.subtask
+                # 链条**始终**以主 Agent 打头：否则第二轮会忘记主 Agent，
+                # 把它当成候选再选一次（重复验证 + 浪费预算）。
+                chain = [assignment.agent_id] + redundancy.get(subtask.id, [])
+                headAgent = self._agent_by_id(chain[-1])
+                failProbability = 1.0 - headAgent.reliability(subtask.domain)
+                for candidate in self.agents:
+                    if candidate.agent_id in chain:
+                        continue
+                    if correlationAware:
+                        correlation = max(
+                            candidate.error_correlation(
+                                self._agent_by_id(member), subtask.domain
+                            )
+                            for member in chain
+                        )
+                    else:
+                        correlation = 0.0
+                    reliability = candidate.reliability(subtask.domain)
+                    # 相关性只用于**打折**，不用于加权放大：Pearson 可以为负，
+                    # 若直接算 (1-ρ) 会得到 >1 的系数，让验证者盖过主 Agent、
+                    # 把本来正确的答案翻掉（实测会把独立场景的正确率拉低）。
+                    discount = 1.0 - max(0.0, correlation)
+                    gain = failProbability * reliability * discount
+                    if best is None or gain > best[0]:
+                        best = (
+                            gain,
+                            subtask.id,
+                            candidate.agent_id,
+                            correlation,
+                            reliability,
+                        )
+            # 阈值而非 >0：相关性≈1 时 gain 只剩浮点噪声，不该拿它去消耗预算。
+            if best is None or best[0] <= MIN_REDUNDANCY_GAIN:
+                break
+            gain, subtaskId, agentId, correlation, reliability = best
+            redundancy.setdefault(subtaskId, []).append(agentId)
+            trace.append(
+                {
+                    "subtask_id": subtaskId,
+                    "agent_id": agentId,
+                    "domain": next(
+                        a.subtask.domain for a in assignments if a.subtask.id == subtaskId
+                    ),
+                    "gain": round(gain, 6),
+                    "correlation": round(correlation, 6),
+                    "reliability": round(reliability, 6),
+                    "rank": len(redundancy[subtaskId]),
+                }
+            )
+            remaining -= 1
+
+        self.redundancy_trace = trace
+        return redundancy
+
+    def _random_redundancy(
+        self,
+        assignments: Sequence[Assignment],
+        budget: int,
+    ) -> tuple[dict[str, list[str]], list[dict]]:
+        """B1 基线：不看风险、不看相关性，随机挑子任务与验证者。
+
+        随机源用全局 ``random``（由 ExperimentRunner 按 seed 播种），因此可复现。
+        """
+        plan: dict[str, list[str]] = {}
+        trace: list[dict] = []
+        subtaskIds = [assignment.subtask.id for assignment in assignments]
+        primaryBySubtask = {a.subtask.id: a.agent_id for a in assignments}
+        domainBySubtask = {a.subtask.id: a.subtask.domain for a in assignments}
+        attempts = 0
+        maxAttempts = max(10, int(budget) * 20)
+        while len(trace) < int(budget) and attempts < maxAttempts:
+            attempts += 1
+            subtaskId = random.choice(subtaskIds)
+            chain = [primaryBySubtask[subtaskId]] + plan.get(subtaskId, [])
+            candidates = [a for a in self.agents if a.agent_id not in chain]
+            if not candidates:
+                continue
+            picked = random.choice(candidates)
+            plan.setdefault(subtaskId, []).append(picked.agent_id)
+            trace.append(
+                {
+                    "subtask_id": subtaskId,
+                    "agent_id": picked.agent_id,
+                    "domain": domainBySubtask[subtaskId],
+                    "gain": None,
+                    "correlation": None,
+                    "reliability": round(
+                        picked.reliability(domainBySubtask[subtaskId]), 6
+                    ),
+                    "rank": len(plan[subtaskId]),
+                }
+            )
+        return plan, trace
+
     def assign_round_robin(self, subtasks: Sequence[SubTask]) -> list[Assignment]:
         """固定顺序轮询分配（对照组B 使用）。
 
@@ -528,10 +691,126 @@ class ControllerAgent:
             prompt, system=self.AGGREGATE_SYSTEM, kind=TaskKind.AGGREGATE
         ).clean_text
 
+    def aggregate_redundant(
+        self,
+        subtask: SubTask,
+        results: Sequence[AgentResult],
+        correlationAware: bool = True,
+    ) -> str:
+        """去相关加权投票：高度相关的同答案只算一份打折证据。
+
+        做法：按后验可靠性从高到低逐个纳入，每个 Agent 的权重为
+        ``Rel_j(domain) × (1 − max_{已纳入} ρ_jk)``——即「已被一个高度相关的
+        同伴支持过」的答案不再获得全额支持。
+        ``correlationAware=False`` 时 ρ 恒为 0，退化为**朴素信誉加权投票**
+        （实验基线 B2 的聚合策略）。
+        """
+        agents = {a.agent_id: a for a in self.agents}
+        usable = [r for r in results if r.ok and r.answer]
+        if not usable:
+            return ""
+
+        ordered = sorted(
+            usable,
+            key=lambda r: -agents[r.agent_id].reliability(subtask.domain)
+            if r.agent_id in agents
+            else 0.0,
+        )
+        weights: dict[str, float] = {}
+        selected: list[str] = []
+        for result in ordered:
+            agent = agents.get(result.agent_id)
+            if agent is None:
+                continue
+            reliability = agent.reliability(subtask.domain)
+            if correlationAware and selected:
+                correlation = max(
+                    agent.error_correlation(agents[member], subtask.domain)
+                    for member in selected
+                )
+            else:
+                correlation = 0.0
+            weights[result.agent_id] = reliability * (1.0 - max(0.0, correlation))
+            selected.append(result.agent_id)
+
+        score: dict[str, float] = defaultdict(float)
+        for result in usable:
+            score[result.answer] += weights.get(result.agent_id, 0.0)
+
+        if not score:
+            return usable[0].answer
+        totalWeight = sum(score.values())
+        if totalWeight <= 0.0:
+            # 全部证据都被相关性打折到 0：退回多数投票，再以最高可靠性者的答案破平
+            counts: dict[str, int] = defaultdict(int)
+            for result in usable:
+                counts[result.answer] += 1
+            bestCount = max(counts.values())
+            tied = [answer for answer, count in counts.items() if count == bestCount]
+            if len(tied) == 1:
+                return tied[0]
+            for result in ordered:
+                if result.answer in tied:
+                    return result.answer
+            return tied[0]
+        return max(score, key=score.get)
+
+    def _merge_redundant(
+        self,
+        subtask: SubTask,
+        primary: AgentResult,
+        secondary: Sequence[AgentResult],
+    ) -> AgentResult:
+        """把主 Agent 与冗余验证 Agent 的结果合成一条最终结果。
+
+        规则（保持可解释，便于论文复现）：
+        * 主结果可用 → 在「主结果 + 可用的冗余结果」上做去相关加权投票；
+        * 主结果失败但冗余结果可用 → 取后验可靠性最高的冗余结果（冗余带来的可用性收益）；
+        * 全部不可用 → 原样返回主结果。
+        """
+        usablePrimary = [primary] if (primary.ok and primary.answer) else []
+        usableSecondary = [r for r in secondary if r.ok and r.answer]
+        allResults = usablePrimary + usableSecondary
+
+        if not allResults:
+            return primary
+        if not usablePrimary:
+            return max(
+                usableSecondary,
+                key=lambda r: self._agent_by_id(r.agent_id).reliability(subtask.domain)
+                if r.agent_id in {a.agent_id for a in self.agents}
+                else 0.0,
+            )
+        if not usableSecondary:
+            return primary
+
+        answer = self.aggregate_redundant(
+            subtask, allResults, correlationAware=self.correlation_aware
+        )
+        return AgentResult(
+            subtask_id=subtask.id,
+            agent_id=primary.agent_id,
+            answer=answer,
+            domain=subtask.domain,
+            difficulty=subtask.difficulty,
+            # 最终答案若来自某个幻觉回答，则整条结果标记为幻觉，指标口径不变
+            hallucinated=any(r.hallucinated and r.answer == answer for r in allResults),
+            # 成本如实计入：这条结果的耗时是本次冗余验证的总 LLM 耗时
+            latency_ms=sum(r.latency_ms for r in allResults),
+            llm_model=primary.llm_model,
+            digest=ht.message_digest(
+                {
+                    "subtask_id": subtask.id,
+                    "agent_id": primary.agent_id,
+                    "answer": answer,
+                    "error": "",
+                }
+            ),
+        )
+
     # ------------------------------------------------------------------
     # 6. 完整流程
     # ------------------------------------------------------------------
-
     def run(
         self,
         question: str,
@@ -555,10 +834,48 @@ class ControllerAgent:
         assignments = self.assign(subtasks) if use_scoring else self.assign_round_robin(subtasks)
         trace.assignments = [a.to_dict() for a in assignments]
 
+        # --- 风险感知的冗余验证：在预算内决定「给哪个子任务加第二/第三意见」---
+        # REDUNDANCY_BUDGET=0（默认）时该分支完全不触发，行为与既有 A/B/C 一致。
+        self.redundancy_trace = []
+        redundancy: dict[str, list[str]] = {}
+        if self.redundancy_budget > 0:
+            redundancy = self.add_redundancy(
+                assignments,
+                self.redundancy_budget,
+                correlationAware=self.correlation_aware,
+                strategy=self.redundancy_strategy,
+            )
+            trace.redundancy = list(self.redundancy_trace)
+
         results: list[AgentResult] = []
         for assignment in assignments:
             try:
                 result = self.dispatch(assignment)
+                extraIds = redundancy.get(assignment.subtask.id, [])
+                if extraIds:
+                    secondary: list[AgentResult] = []
+                    for extraId in extraIds:
+                        try:
+                            secondary.append(
+                                self.dispatch(
+                                    Assignment(
+                                        subtask=assignment.subtask,
+                                        agent_id=extraId,
+                                        score=0.0,
+                                    )
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            # 冗余 Agent 失败不应连累主结果，只跳过这一个验证者
+                            logger.warning(
+                                "冗余验证派发 %s → %s 失败：%s",
+                                assignment.subtask.id,
+                                extraId,
+                                exc,
+                            )
+                    result = self._merge_redundant(
+                        assignment.subtask, result, secondary
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("派发 %s 失败：%s", assignment.subtask.id, exc)
                 result = AgentResult(

@@ -38,9 +38,14 @@ crypto/*.pem
 *.p12
 *.pfx
 
-# 实验产物
+# 实验产物（含 results_correlation：实验数据不随仓库发布）
 results/
 results_*/
+
+# 本地临时/离线材料（不上仓库）
+_tmpenv/
+.dsh_tools/
+BlkMac_Offline_Files/
 
 # 合约编译与本地链数据
 blockchain/build/

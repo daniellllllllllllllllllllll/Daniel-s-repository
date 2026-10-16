@@ -141,6 +141,21 @@ class MockLLM(BaseLLM):
         h = hashlib.sha256(f"{self.seed}|{salt}|{prompt}".encode("utf-8")).digest()
         return random.Random(int.from_bytes(h[:8], "big"))
 
+    def _group_rng(
+        self, prompt: str, error_group: str, kind: str, difficulty: int
+    ) -> random.Random:
+        """同组共享的「错误潜因子」随机源。
+
+        **故意不包含 ``self.seed``**：每个 Agent 的 seed 是 ``实验种子 + salt``，
+        各不相同；若把 seed 掺进来，同组的不同 Agent 依然会抽到不同的随机流，
+        「共享错误潜因子」就名存实亡（实测表现为同组相关性只有 0.18 而不是 1.0）。
+        这里只按 (分组, 任务类型, 难度, 提示词) 派生，保证同题同组抽样一致。
+        """
+        h = hashlib.sha256(
+            f"errgroup|{error_group}|{kind}|{difficulty}|{prompt}".encode("utf-8")
+        ).digest()
+        return random.Random(int.from_bytes(h[:8], "big"))
+
     def _hallucinate_probability(self, competence: float, difficulty: int) -> float:
         p = self.hallucination_rate * (1.0 - competence) * (1.0 + 0.25 * (difficulty - 1))
         return min(max(p, 0.0), 1.0)
@@ -237,12 +252,20 @@ class MockLLM(BaseLLM):
         return f"综合各子任务结论：{prompt[-300:]}"
 
     def _mock_answer(
-        self, prompt: str, rng: random.Random, competence: float, difficulty: int
+        self,
+        prompt: str,
+        rng: random.Random,
+        competence: float,
+        difficulty: int,
+        error_rng: random.Random | None = None,
     ) -> tuple[str, bool]:
         correct = self._lookup_answer(prompt)
         p = self._hallucinate_probability(competence, difficulty)
-        if rng.random() < p:
-            return self._wrong_answer(rng, correct) + HALLUCINATION_MARK, True
+        # 错误潜因子：同组 Agent 用同一随机源抽「是否幻觉」，并据此选出同一个错答。
+        # error_rng 为 None（未启用分组）时行为与既有一致。
+        source = error_rng if error_rng is not None else rng
+        if source.random() < p:
+            return self._wrong_answer(source, correct) + HALLUCINATION_MARK, True
         if correct is not None:
             return correct, False
         # 知识库里没有的问题：给一个中性回答，不算幻觉
@@ -254,7 +277,23 @@ class MockLLM(BaseLLM):
         kind = kwargs.get("kind", TaskKind.ANSWER)
         competence = float(kwargs.get("competence", self.competence))
         difficulty = int(kwargs.get("difficulty", 1))
-        rng = self._rng(prompt, salt=f"{kind}|{competence:.3f}|{difficulty}")
+        error_group = kwargs.get("error_group", None)
+        salt = f"{kind}|{competence:.3f}|{difficulty}"
+        if error_group is not None:
+            # error_group 为 None（默认）时 salt 与既有实现逐字符相同，
+            # 保证既有实验的确定性不被破坏。
+            salt += f"|g{error_group}"
+        rng = self._rng(prompt, salt=salt)
+
+        # 「错误潜因子」随机源：只依赖 (分组, 任务类型, 难度, 提示词)，**不含 competence**。
+        # 同一组内能力不同的 Agent 因此共享同一个均匀抽样——低能力 Agent 的幻觉阈值 p 更大，
+        # 于是「谁在哪些题上出错」呈现正相关（共单调），这就是可控的相关错误。
+        # 每个 Agent 各自新建同种子的 Random 实例，互不消耗对方状态。
+        groupRng = (
+            self._group_rng(prompt, error_group, str(kind), difficulty)
+            if error_group is not None
+            else None
+        )
 
         hallucinated = False
         if kind == TaskKind.DECOMPOSE:
@@ -262,7 +301,9 @@ class MockLLM(BaseLLM):
         elif kind == TaskKind.AGGREGATE:
             text = self._mock_aggregate(prompt)
         else:
-            text, hallucinated = self._mock_answer(prompt, rng, competence, difficulty)
+            text, hallucinated = self._mock_answer(
+                prompt, rng, competence, difficulty, groupRng
+            )
 
         if hallucinated:
             self.hallucination_count += 1
